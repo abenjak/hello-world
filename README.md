@@ -1,2 +1,3 @@
 # hello-world
-My first GitHub project.
+My name is Andrej Benjak, and I am a bioinformatician.
+I am totally into genomics.
