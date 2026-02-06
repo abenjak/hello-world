@@ -1,0 +1,573 @@
+---
+title: "Wilms tumor, SRP358696 bulk RNAseq analysis"
+output: html_notebook
+---
+
+Preliminary analysis of the SRP358696 dataset, which contain Wilms tumor samples.
+
+```{r}
+set.seed(123)
+
+library(DESeq2)
+library(fgsea)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(patchwork)
+library(ggplotify)
+library(EnhancedVolcano)
+library(ggvenn)
+source("/storage/research/dbmr_rubin_lab/scripts/save_png_pdf.R")
+source("/storage/research/dbmr_rubin_lab/scripts/fgsea_save_res.R")
+
+plotdir=("plots/")
+if(!dir.exists(plotdir)){dir.create(plotdir,  recursive = T)}
+
+```
+
+Load sample names
+```{r}
+samples <- scan("../samples.txt", character())
+```
+
+Load rsem counts
+```{r}
+rsem_res_coding <- read.table("../rsem/all.genes.expected_count.results_coding", header = T, sep = "\t", row.names=1, check.names = F)
+
+rsem_res_coding$gene_name_uniq <- make.unique(rsem_res_coding$gene_name)
+
+```
+
+remove metadata cols (note new rsem has more cols)
+last col is gene_name_uniq
+```{r}
+counts <- rsem_res_coding[c(-1:-27, -ncol(rsem_res_coding))]
+
+rownames(counts) <- rsem_res_coding$gene_name_uniq
+```
+
+
+counts need to be integers
+```{r}
+counts <- round(counts)
+```
+
+remove low counts
+```{r}
+counts <- counts[rowSums(counts) > 5,]
+```
+
+
+Load metadatra
+```{r}
+meta <- openxlsx::read.xlsx("../GSE200256_metadata_bulk_RNA_seq.xlsx")
+
+meta$sample <- sub("_", "", meta[["Sample.Name"]])
+
+```
+
+
+assure same order
+```{r echo = T}
+identical(meta$sample, colnames(counts))
+```
+### DESeq2
+set coldata
+```{r}
+coldata <- data.frame(condition = gsub(" .+", "", meta$isolate),
+						tissue = meta$tissue,
+						sex = meta$sex,
+					row.names =  colnames(counts))
+```
+
+construct a DESeqDataSet
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = counts,
+							colData = coldata,
+							design = ~ condition + tissue + sex)
+#relevel
+relevel(dds$condition, ref = "Favorable")
+```
+
+run DGE inference
+```{r}
+dds <- DESeq(dds)
+```
+
+Variance stabilizing transformation
+```{r}
+vsd <- vst(dds, blind=FALSE)
+```
+
+z-scores of vst data (for visualisation etc.)
+```{r}
+vsd.zscore <- as.data.frame(t(scale(t(assay(vsd)), scale=TRUE, center=TRUE)))
+```
+
+#### Heatmap of the sample-to-sample distances
+```{r results=FALSE}
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")) )(255)
+
+# use fixed cell sizes to look symmetrical, then adjust figure size to have proper margins
+p <- pheatmap::pheatmap(sampleDistMatrix,
+		clustering_distance_rows=sampleDists,
+		clustering_distance_cols=sampleDists,
+		col=colors,
+		annotation = coldata,
+		main = "Sample distance\n",
+		cellwidth = 12, cellheight = 12,
+		silent = T)
+
+save_png_pdf(p, paste0(plotdir, "heatmap"), height = 12, width = 12)
+```
+```{r echo=F, fig.height=12, fig.width=12}
+# pheatmap quirk
+plot(p$gtable)
+```
+
+
+
+#### PCA
+```{r fig.height=5, fig.width=8, fig.keep='all'}
+pca <- list("PC1-PC2" = 1:2,
+			"PC3-PC4" = 3:4,
+			"PC5-PC6" = 5:6,
+			"PC7-PC8" = 7:8,
+			"PC9-PC10" = 9:10)
+
+for (x in names(pca)) {
+	cat(x, "\n")
+	pcaData <- plotPCA(vsd, intgroup=c("condition"), returnData=TRUE, pcsToUse = pca[[x]])
+	percentVar <- round(100 * attr(pcaData, "percentVar"))
+	
+	p <- ggplot(pcaData, aes(!!sym(paste0("PC", pca[[x]][1])), !!sym(paste0("PC", pca[[x]][2])), fill=condition, color=tissue, shape=sex)) +
+		geom_point(size=3, stroke = 1.2) +
+		scale_shape_manual(values = 21:25) + # use fillable shapes
+		scale_color_brewer(type = "qual", palette = "Set1",
+						guide = guide_legend(override.aes = list(shape = 1))) + # use a hollow shape in legend
+		scale_fill_manual(values = c("Anaplastic" = "grey20", "Favorable" = "grey90"),
+						guide = guide_legend(override.aes = list(shape = 23, stroke=0.5))) + # use fillable shape in legend
+		xlab(paste0("PC",pca[[x]][1],": ",percentVar[1],"% variance")) +
+		ylab(paste0("PC",pca[[x]][2],": ",percentVar[2],"% variance")) +
+		xlim(c(-max(abs(pcaData[[paste0("PC", pca[[x]][1])]]))-1, max(abs(pcaData[[paste0("PC", pca[[x]][1])]]))+1)) + # PC can be small that dots get trimmed. Expand a bit.
+		ylim(c(-max(abs(pcaData[[paste0("PC", pca[[x]][2])]]))-1, max(abs(pcaData[[paste0("PC", pca[[x]][2])]]))+1)) + # PC can be small that dots get trimmed. Expand a bit.
+		geom_text_repel(aes(label = name),
+						size = 1.5,
+						segment.size = 0.1,
+						colour = 'grey50',
+						box.padding   = 0.10,
+						segment.color = 'grey50',
+						force = 50,
+						max.overlaps = 30,
+						show.legend = F) +
+		theme_minimal()
+	
+	save_png_pdf(p, paste0(plotdir, x), height = 5, width = 8)
+	print(p)
+}
+```
+
+verify comparisons
+```{r}
+resultsNames(dds)
+```
+
+Differential expression results for each comparison
+There is only 1 comparison
+```{r}
+c <- "Anaplastic_vs_Favorable"
+res <- results(dds, contrast = c("condition", "Anaplastic", "Favorable"), alpha = 0.05)
+```
+
+MA-plot
+```{r}
+save_png_pdf(plotMA(res, ylim=c(-10,10)), paste0(plotdir, "DESeq2_res.", c, ".MA-plot"))
+```
+```{r echo=F}
+plotMA(res, ylim=c(-10,10))
+```
+
+
+
+res to table, and add gene info
+```{r}
+res.df <- as.data.frame(res)
+
+
+res.df <- merge(res.df, rsem_res_coding[,c("gene_name_uniq", "gene_name", "gene_id", "gene_type", "seqnames", "start", "end", "width", "strand")], by.x=0, by.y="gene_name_uniq", all.x = T, all.y = F, sort = F)
+colnames(res.df)[1] <- "gene_name_uniq"
+
+```
+
+save results
+```{r}
+openxlsx::write.xlsx(res.df, file="DESeq2_res.xlsx")
+```
+
+
+### [volcano plots]
+[EnhancedVolcano](https://bioconductor.org/packages/devel/bioc/vignettes/EnhancedVolcano/inst/doc/EnhancedVolcano.html)
+```{r warning=FALSE}
+p <- EnhancedVolcano(res.df,
+					lab = res.df$gene_name,
+					x = 'log2FoldChange',
+					y = 'padj',
+					ylab = bquote(~-Log[10] ~ italic(Padj)),
+					title = c,
+					subtitle = NULL,
+					cutoffLineCol = "gray10",
+					cutoffLineWidth = 0.2,
+					pointSize = 2,
+					labSize = 3,
+					axisLabSize = 15,
+					titleLabSize = 15,
+					labCol = "gray30",
+					col = c("grey60", "slategray3", "lightpink", "tomato"),
+					legendPosition = 'right',
+					legendLabels=c("NS", expression(Log[2] ~ FC), "Padj", expression(Padj ~ and ~ Log[2] ~ FC)),
+					legendLabSize = 10,
+					max.overlaps = 50,
+					drawConnectors = T,
+					widthConnectors = 0.1,
+					arrowheads = F,
+					colConnectors = "grey30",
+					directionConnectors="both" # 'y' works ok for fewer genes. ideal should be upregulated to one side, down to the other
+					) +
+	theme_minimal()
+
+save_png_pdf(p, paste0(plotdir, "EnhancedVolcano.", c), height = 6, width = 8)
+```
+
+```{r echo=F, fig.height=6, fig.width=8}
+print(p)
+```
+
+
+
+### fgsea Msigdb
+Load get gene sets in gmt
+```{r}
+msigdb.hs.gmt <- readRDS("/storage/research/dbmr_rubin_lab/resources/msigdb/msigdb.hs.gmt.rds")
+msigdb.hs.info <- readRDS("/storage/research/dbmr_rubin_lab/resources/msigdb/msigdb.hs.info.df.rds")
+```
+
+make rank
+```{r}
+res.rank <- setNames(res.df$stat, make.unique(res.df$gene_name))
+```
+
+
+run only relevant collections
+```{r}
+collections <- c("C2.CP", "C2.CP:KEGG_LEGACY", "C2.CP:KEGG_MEDICUS", "C2.CP:REACTOME", "C4.3CA", "C4.CGN", "C4.CM", "C5.GO:BP", "C5.GO:MF", "C6", "C7.IMMUNESIGDB", "C8", "H")
+```
+
+run fgsea
+```{r}
+res.fgseaRes.msigdb <- sapply(collections, function(x) {
+	cat(c, x, "\n")
+	fgsea(pathways = msigdb.hs.gmt[[x]],
+			stats = res.rank,
+			eps = 0.0, minSize = 15, maxSize = 500)
+}, simplify=F)
+
+# Save session
+save.image(file="session.RData")
+```
+
+
+Plot fgsea results
+```{r}
+fgsea_save_res(res.fgseaRes.msigdb,
+				rank = res.rank,
+				basename = "fgsea.",
+				gmt = msigdb.hs.gmt[collections],
+				gmt_info = msigdb.hs.info,
+				suffix = c,
+				subtitle = c)
+```
+
+
+## DE on transcript level
+
+load rsem counts
+```{r}
+rsem_res_coding.transcript <- read.table("../rsem/all.isoforms.expected_count.results_coding", header = T, sep = "\t", row.names=1, check.names = F)
+
+# remove metadata cols (note new rsem has more cols)
+counts.transcript <- rsem_res_coding.transcript[-1:-27]
+
+# rownames can be transcript_name (they are unique)
+sum(duplicated(rsem_res_coding.transcript$transcript_name))
+# [1] 0
+# but replace "-" with "_" so DESeq2 does not complain
+rownames(counts.transcript) <- sub("-", "_", rsem_res_coding.transcript$transcript_name)
+```
+
+Prepare counts
+```{r}
+# counts.transcript need to be integers
+counts.transcript <- round(counts.transcript)
+
+# remove low counts.transcript
+counts.transcript <- counts.transcript[rowSums(counts.transcript) > 5,]
+```
+
+### DESeq2
+construct a DESeqDataSet
+```{r}
+dds.transcript <- DESeqDataSetFromMatrix(countData = counts.transcript,
+							colData = coldata,
+							design = ~ condition + tissue + sex) 
+
+# relevel
+relevel(dds.transcript$condition, ref = "Favorable")
+```
+
+
+run DGE inference
+```{r}
+dds.transcript <- DESeq(dds.transcript)
+```
+
+
+Variance stabilizing transformation
+```{r}
+vsd.transcript <- vst(dds.transcript, blind=FALSE)
+```
+
+z-scores of vst data (for visualisation etc.)
+```{r}
+vsd.transcript.zscore <- as.data.frame(t(scale(t(assay(vsd.transcript)), scale=TRUE, center=TRUE)))
+```
+
+
+Heatmap of the sample-to-sample distances
+```{r}
+sampleDists <- dist(t(assay(vsd.transcript)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")) )(255)
+
+# use fixed cell sizes to look symmetrical, then adjust figure size to have proper margins
+p <- pheatmap::pheatmap(sampleDistMatrix,
+		clustering_distance_rows=sampleDists,
+		clustering_distance_cols=sampleDists,
+		col=colors,
+		annotation = coldata,
+		main = "Sample distance\n",
+		cellwidth = 12, cellheight = 12,
+		silent=T)
+
+save_png_pdf(p, paste0(plotdir, "heatmap.transcript"), height = 12, width = 12)
+```
+
+```{r echo=F, fig.height=12, fig.width=12}
+# pheatmap quirk
+plot(p$gtable)
+```
+
+PCA
+```{r fig.height=5, fig.width=8, fig.keep='all'}
+pcaData <- plotPCA(vsd.transcript, intgroup=c("condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+p <- ggplot(pcaData, aes(PC1, PC2, fill=condition, color=tissue, shape=sex)) +
+	geom_point(size=3, stroke = 1.2) +
+	scale_shape_manual(values = 21:25) + # use fillable shapes
+	scale_color_brewer(type = "qual", palette = "Set1",
+					guide = guide_legend(override.aes = list(shape = 1))) + # use a hollow shape in legend
+	scale_fill_manual(values = c("Anaplastic" = "grey20", "Favorable" = "grey90"),
+					guide = guide_legend(override.aes = list(shape = 23, stroke=0.5))) + # use fillable shape in legend
+	xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+	ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+	ylim(c(-max(abs(pcaData$PC2))-1, max(abs(pcaData$PC2))+1)) + # if PC2 is small dots get trimmed. Expand a bit.
+	geom_text_repel(aes(label = name),
+					size = 1.5,
+					segment.size = 0.1,
+					colour = 'grey50',
+					box.padding   = 0.10,
+					segment.color = 'grey50',
+					force = 50,
+					max.overlaps = 30,
+					show.legend = F) +
+	theme_minimal()
+
+save_png_pdf(p, paste0(plotdir, "PCA.transcript"), height = 5, width = 8)
+print(p)
+```
+
+Fetch results
+```{r}
+res.transcript <- results(dds.transcript, contrast = c("condition", "Anaplastic", "Favorable"), alpha = 0.05)
+```
+
+MA-plot
+```{r}
+save_png_pdf(plotMA(res.transcript, ylim=c(-20,20)), paste0(plotdir, "DESeq2_res.transcript.", c, ".MA-plot"))
+```
+
+```{r echo=F}
+plotMA(res.transcript, ylim=c(-10,10))
+```
+
+res to table, and add gene info
+```{r}
+res.transcript.df <- as.data.frame(res.transcript)
+
+# _ to - so that we can merge
+res.transcript.df$transcript_name <- sub("_", "-", rownames(res.transcript))
+
+res.transcript.df <- merge(res.transcript.df, rsem_res_coding.transcript[,c("transcript_name", "transcript_id", "transcript_type", "gene_name", "gene_id", "seqnames", "start", "end", "width", "strand")], by="transcript_name", all.x = T, all.y = F, sort = F)
+```
+
+save results
+```{r}
+openxlsx::write.xlsx(res.transcript.df, file="DESeq2_res.transcript.xlsx")
+```
+
+
+### volcano plots
+[EnhancedVolcano](https://bioconductor.org/packages/devel/bioc/vignettes/EnhancedVolcano/inst/doc/EnhancedVolcano.html)
+```{r}
+p <- EnhancedVolcano(res.transcript.df,
+					lab = res.transcript.df$transcript_name,
+					x = 'log2FoldChange',
+					y = 'padj',
+					ylab = bquote(~-Log[10] ~ italic(Padj)),
+					title = c,
+					subtitle = NULL,
+					cutoffLineCol = "gray10",
+					cutoffLineWidth = 0.2,
+					pointSize = 2,
+					labSize = 2,
+					axisLabSize = 15,
+					titleLabSize = 15,
+					labCol = "gray30",
+					col = c("grey60", "slategray3", "lightpink", "tomato"),
+					legendPosition = 'right',
+					legendLabels=c("NS", expression(Log[2] ~ FC), "Padj", expression(Padj ~ and ~ Log[2] ~ FC)),
+					legendLabSize = 10,
+					max.overlaps = 50,
+					drawConnectors = T,
+					widthConnectors = 0.1,
+					arrowheads = F,
+					colConnectors = "grey30",
+					) +
+	theme_minimal()
+
+save_png_pdf(p, paste0(plotdir, "EnhancedVolcano.transcript.", c), height = 6, width = 8)
+```
+
+
+```{r echo=F, fig.height=6, fig.width=8}
+print(p)
+```
+
+
+
+### Kallisto
+load kallisto counts over transcripts
+```{r}
+kallisto_res.transcript <- read.table("../kallisto/all.est_count.txt.gz", header = T, sep = "\t", row.names=1, check.names = F)[-1] # omit column "length"
+```
+
+#### use tximport to aggregate to gene level
+##### Prepare data
+read the gtf used for the Kallisto index (full anno, not just "annotation" or "primary_assembly.annotation")
+```{r}
+gencode.v48 <- rtracklayer::readGFF("/storage/research/dbmr_rubin_lab/pipeline/ref/anno/hg38/gencode.v48.chr_patch_hapl_scaff.annotation.gtf.gz")
+```
+
+did we fetch everything?
+```{r}
+sum(!rownames(kallisto_res.transcript) %in% gencode.v48$transcript_id)
+```
+
+more sanity checks
+```{r}
+rsem_transcript_list <- read.table("../rsem/all.isoforms.expected_count.results", header = T, sep = "\t")[[1]]
+sum(rsem_transcript_list %in% gencode.v48$transcript_id)
+length(rsem_transcript_list)
+```
+
+make a data.frame called tx2gene with two columns: 1) transcript ID and 2) gene ID. The column names do not matter but this column order must be used.
+```{r}
+tx2gene <- gencode.v48[c("transcript_id", "gene_id")]
+
+# remove NA and duplicate transcripts
+tx2gene <- na.omit(tx2gene)
+tx2gene <- tx2gene[!duplicated(tx2gene$transcript_id),]
+```
+
+gene counts from kallisto TSV files
+```{r}
+k_files <- file.path("../kallisto", samples, "abundance.tsv.gz")
+names(k_files) <- samples
+```
+
+tximport to aggregate to gene level
+```{r}
+# we don't need ignoreAfterBar
+kallisto_res.gene <- tximport::tximport(k_files, type = "kallisto", tx2gene = tx2gene)
+
+# to df
+kallisto_res.gene.df <- as.data.frame(kallisto_res.gene[["abundance"]])
+```
+
+
+### compare rsem and kallisto
+```{r}
+rsem_res <- read.table("../rsem/all.genes.expected_count.results", header = T, sep = "\t", row.names=1, check.names = F)[c(-1:-27)] # omit metadata cols
+
+rsem_res.transcript <- read.table("../rsem/all.isoforms.expected_count.results", header = T, sep = "\t", row.names=1, check.names = F)[c(-1:-27)] # omit metadata cols
+```
+
+sanity check
+```{r}
+identical(colnames(rsem_res.transcript), colnames(kallisto_res.transcript))
+```
+
+
+Note: kallisto has more genes/transcripts than rsem (which are all in kallisto)
+```{r}
+rsem_vs_kallisto <- list(transcript = cor(rsem_res.transcript, kallisto_res.transcript[rownames(rsem_res.transcript),], method = "spearman"))
+
+rsem_vs_kallisto[["transcript.coding"]] <- cor(rsem_res_coding.transcript[-1:-27], kallisto_res.transcript[rownames(rsem_res_coding.transcript),], method = "spearman")
+
+rsem_vs_kallisto[["gene"]] <- cor(rsem_res, kallisto_res.gene.df[rownames(rsem_res),], method = "spearman")
+
+rsem_vs_kallisto[["gene.coding"]] <- cor(rsem_res[rownames(rsem_res_coding),], kallisto_res.gene.df[rownames(rsem_res_coding),], method = "spearman")
+```
+
+Plot correlatoions
+```{r fig.height=10, fig.width=10, fig.keep='all'}
+for (x in names(rsem_vs_kallisto)) {
+	p <- ComplexHeatmap::pheatmap(rsem_vs_kallisto[[x]],
+		cluster_rows = F,
+		cluster_cols = F,
+		main = paste0("RSEM vs. Kallisto", "\n", "counts", "\n", x),
+		fontsize_row = 8,
+		fontsize_col = 8,
+		cellheight = 12,
+		cellwidth = 12,
+		display_numbers = T,
+		fontsize_number = 4,
+		heatmap_legend_param = list(title = "Spearman"))
+
+	save_png_pdf(p, paste0(plotdir, "rsem_vs_kallisto.", x), height = 10, width = 10)
+	print(p)
+}
+```
+
+Save session
+```{r}
+save.image(file="session.RData")
+```
+
+```{r}
+sessioninfo::session_info()
+```
